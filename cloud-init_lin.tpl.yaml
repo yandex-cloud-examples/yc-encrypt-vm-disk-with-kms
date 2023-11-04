@@ -1,0 +1,96 @@
+#cloud-config
+#ssh_pwauth: no
+users:
+  - name: yc-user
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: sudo
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - "${ssh_key}"
+packages:
+  - awscli
+  - cryptsetup-bin
+  - curl
+package_update: true
+write_files:
+-   content: |
+        #!/usr/bin/env bash
+
+        #
+        # Клиентское шифрование диска на ключе из YC KMS
+        #
+
+        set -e -x
+        
+      
+        
+
+        YC=~/yandex-cloud/bin/yc
+        CMD="$1"
+
+        case "$CMD" in
+            create)
+              #Создание ключа с высокой энтропией метод generateDataKey (https://cloud.yandex.ru/docs/kms/api-ref/SymmetricCrypto/generateDataKey)
+              #Необходимо выполнить 1 раз и хранить ENCRYPTED_DEK_FILE в защищенном удаленном месте
+              mkdir ${MOUNT}
+              $YC kms symmetric-crypto generate-data-key --id ${KMS_KEY_ID} --data-key-spec=aes-256 --data-key-ciphertext-file=${ENCRYPTED_DEK_FILE} --data-key-plaintext-file=${PLAINTEXT_DEK_FILE}
+              cryptsetup -v --type luks --cipher aes-xts-plain64 --key-size 512 --hash sha256 --iter-time 2000 --use-urandom -q luksFormat "${DEVICE}" "${PLAINTEXT_DEK_FILE}"
+              cat "${PLAINTEXT_DEK_FILE}" | cryptsetup open "${DEVICE}" "${MAPPED_DEVICE}" -d -
+              mkfs -t ext4 "/dev/mapper/${MAPPED_DEVICE}"
+              aws --endpoint-url=https://storage.yandexcloud.net s3 cp ${ENCRYPTED_DEK_FILE} s3://${BUCKET_NAME}/encrypted1_dek.enc #копируем ключ в S3
+              rm ${PLAINTEXT_DEK_FILE} # удаляем расшифрованный ключ
+              rm ${ENCRYPTED_DEK_FILE} # удаляем зашифрованный ключ
+              ;;
+            #Монтирование зашифрованного диска в расшифрованный объект
+            #Можно выполнять, например при старте ОС
+            open)
+              aws --endpoint-url=https://storage.yandexcloud.net s3 cp s3://${BUCKET_NAME}/encrypted1_dek.enc ${ENCRYPTED_DEK_FILE}
+              #Вывод plaintext-file для расшифровки 
+              $YC kms symmetric-crypto decrypt --id ${KMS_KEY_ID} --ciphertext-file=${ENCRYPTED_DEK_FILE} --plaintext-file=${PLAINTEXT_DEK_FILE}
+              cat "${PLAINTEXT_DEK_FILE}" | cryptsetup open "${DEVICE}" "${MAPPED_DEVICE}" -d -
+              rm ${PLAINTEXT_DEK_FILE} # удаляем расшифрованный ключ
+              rm ${ENCRYPTED_DEK_FILE} # удаляем зашифрованный ключ
+              mount -t ext4 "/dev/mapper/${MAPPED_DEVICE}" ${MOUNT}
+              ;;
+            #Размонтирование зашифрованного устройства
+            close)
+              umount ${MOUNT}
+              cryptsetup close ${MAPPED_DEVICE}
+              ;;
+            #Удаление исходного устройства
+            erase)
+              cryptsetup luksErase ${DEVICE}
+              ;;
+            *)
+              exit 3
+              ;;
+        esac
+    path: /home/yandex-cloud/script-enc.sh
+    permissions: '0777'
+-   content: |
+        [Unit]
+        Description=Template Settings Service
+        After=network.target
+        [Service]
+        Type=oneshot
+        User=root
+        ExecStart=/home/yandex-cloud/script-enc.sh open
+        [Install]
+        WantedBy=multi-user.target
+    path: /etc/systemd/system/test-script.service
+    permissions: '664'
+runcmd:
+  - export HOME=/root
+  - cd /home/yandex-cloud
+  - curl https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash > /home/yandex-cloud/log.log
+  - sleep 10 
+  - source "/root/.bashrc"
+  - aws configure set aws_access_key_id "${aws_key}"
+  - aws configure set aws_secret_access_key "${aws_sec}"
+  - aws configure set default.region ru-central1
+  - /home/yandex-cloud/script-enc.sh create 
+  - sleep 20
+  - systemctl daemon-reload
+  - systemctl start test-script.service
+  - systemctl enable test-script.service
+  - reboot
